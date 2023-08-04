@@ -36,6 +36,7 @@ With the help of [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa)
 </div>
 
 ### GPTQ-LoRA
+**Note** For LLaMA-2, transformers should be updated to **4.31.0**
 - step 1: quantize the LLMs into low-bit precision. More details can refer to [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa).
 ```bash
 CUDA_VISIBLE_DEVICES=1 python $base_dir/llama.py /mnt/data/pyliu/llama-65b-hf c4 --wbits 2 --true-sequential --act-order --groupsize 128 --save $out_dir/llama65b-2bit.pt $4
