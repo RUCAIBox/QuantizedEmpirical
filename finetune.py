@@ -7,7 +7,6 @@ import torch
 import transformers
 from datasets import load_dataset
 from typing import List, Optional, Union
-import sys
 import gc
 
 """
@@ -16,36 +15,34 @@ import torch.nn as nn
 import bitsandbytes as bnb
 """
 from peft import (  # noqa: E402
-    GPTQLoraConfig,
     LoraConfig,
     BottleneckConfig,
+    PrefixTuningConfig,
     get_peft_model,
     get_peft_model_state_dict,
     prepare_model_for_int8_training,
     set_peft_model_state_dict,
+    GPTQLoraConfig,
 )
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, LlamaConfig, AutoModel  # noqa: F402
-from transformers import LlamaForCausalLM
-from transformers import Trainer
 import copy
-from peft import PrefixTuningConfig
 import numpy as np
 import random
-from models.quant.quant_linear_lora import make_quant_linear
-from transformers.modeling_utils import _load_state_dict_into_meta_model
-from models.bigmodeling import init_empty_weights, load_checkpoint_and_dispatch, load_checkpoint_in_model, dispatch_model
 from accelerate.utils import infer_auto_device_map
-seed_value = 2023   # 设定随机数种子
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, LlamaConfig, AutoModel  # noqa: F402
+from transformers import LlamaForCausalLM, Trainer
+from transformers.modeling_utils import _load_state_dict_into_meta_model
+from models.quant.quant_linear_lora import make_quant_linear
+from models.bigmodeling import init_empty_weights, load_checkpoint_and_dispatch, load_checkpoint_in_model, dispatch_model
 
+seed_value = 2023   # 设定随机数种子
+os.environ['PYTHONHASHSEED'] = str(seed_value)  # 为了禁止hash随机化，使得实验可复现。
 np.random.seed(seed_value)
 random.seed(seed_value)
-os.environ['PYTHONHASHSEED'] = str(seed_value)  # 为了禁止hash随机化，使得实验可复现。
-
 torch.manual_seed(seed_value)     # 为CPU设置随机种子
 torch.cuda.manual_seed(seed_value)      # 为当前GPU设置随机种子（只用一块GPU）
 torch.cuda.manual_seed_all(seed_value)   # 为所有GPU设置随机种子（多块GPU）
+torch.backends.cudnn.deterministic = True # 卷积
 
-torch.backends.cudnn.deterministic = True
 module_dic = {
     'q_proj': "layers.{}.self_attn.q_proj",
     'k_proj': "layers.{}.self_attn.k_proj",
@@ -65,6 +62,7 @@ def train(
         data_path: str = "yahma/alpaca-cleaned",
         output_dir: str = "./lora-alpaca",
         adapter_name: str = "lora",
+        load_8bit : bool = False,
         # training hyperparams
         batch_size: int = 128,
         micro_batch_size: int = 4,
@@ -88,6 +86,8 @@ def train(
         use_adapterp: bool = False,
         target_modules: List[str] = None, # also use for FFT and MPO
         scaling: Union[float, str] = 1.0,
+        # prefix tuning hyperparams
+        num_virtual_tokens: int = 30,
         # llm hyperparams
         train_on_inputs: bool = True,  # if False, masks out inputs in loss
         group_by_length: bool = False,  # faster, but produces an odd training loss curve
@@ -164,6 +164,7 @@ def train(
         os.environ["WANDB_WATCH"] = wandb_watch
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
+
     n_gpus = torch.cuda.device_count()
     max_memory = f'{80000}MB'
     max_memory = {i: max_memory for i in range(n_gpus)}
@@ -173,47 +174,23 @@ def train(
         local_rank = int(os.environ.get('LOCAL_RANK', '0'))
         device_map = {'': local_rank}
         max_memory = {'': max_memory[local_rank]}
-    if "chatglm" in base_model:
-        model = AutoModel.from_pretrained(
+
+    if load_8bit:
+        model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            load_in_8bit=True,
+            load_in_8bit=load_8bit,
             torch_dtype=torch.float16,
             device_map=device_map,
             trust_remote_code=True,
         )
-    elif adapter_name == 'gptqlora':
-
-        with init_empty_weights():
-            model = LlamaForCausalLM.from_pretrained(base_model,torch_dtype=torch.float16)
-        config = GPTQLoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-            bits=bits,
-            groupsize=128
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            load_in_8bit=False,
+            torch_dtype=torch.float16,
+            device_map={"": int(os.environ.get("LOCAL_RANK") or 0)},
+            trust_remote_code=True,
         )
-       
-        model = get_peft_model(model, config)
-        load_checkpoint_in_model(model,quant_checkpoint,device_map=device_map) #加载权重
-        torch.cuda.empty_cache()
-        gc.collect()
-    elif adapter_name == 'lora':
-        config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=lora_target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        with init_empty_weights():
-            model = LlamaForCausalLM.from_pretrained(base_model,torch_dtype=torch.float16,device_map=device_map)
-        model = get_peft_model(model, config)
-        torch.cuda.empty_cache()
-        gc.collect()
 
     if model.config.model_type == "llama":
         # Due to the name of transformers' LlamaTokenizer, we have to do this
@@ -273,8 +250,18 @@ def train(
                                                                     user_prompt_len:
                                                                     ]  # could be sped up, probably
         return tokenized_full_prompt
-
-    if adapter_name == "lora":
+    
+    model = prepare_model_for_int8_training(model, use_gradient_checkpointing=use_gradient_checkpointing)
+    
+    if "chatglm" in base_model:
+        model = AutoModel.from_pretrained(
+            base_model,
+            load_in_8bit=True,
+            torch_dtype=torch.float16,
+            device_map=device_map,
+            trust_remote_code=True,
+        )
+    elif adapter_name == 'lora':
         config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
@@ -284,6 +271,11 @@ def train(
             task_type="CAUSAL_LM",
             lora_mpo=lora_mpo
         )
+        with init_empty_weights():
+            model = LlamaForCausalLM.from_pretrained(base_model,torch_dtype=torch.float16,device_map=device_map)
+        model = get_peft_model(model, config)
+        torch.cuda.empty_cache()
+        gc.collect()
     elif adapter_name == "bottleneck":
         config = BottleneckConfig(
             bottleneck_size=bottleneck_size,
@@ -296,12 +288,18 @@ def train(
             bias="none",
             task_type="CAUSAL_LM",
         )
-    elif adapter_name == "prefix":
+        model = get_peft_model(model, config)
+        torch.cuda.empty_cache()
+        gc.collect()
+    elif adapter_name == "prefix-tuning":
         config = PrefixTuningConfig(
-            encoder_hidden_size=768,
-            prefix_projection=False
+            num_virtual_tokens=num_virtual_tokens,
+            task_type="CAUSAL_LM",
         )
-    elif adapter_name == "gptqlora":
+        model = get_peft_model(model, config)
+        torch.cuda.empty_cache()
+        gc.collect()
+    elif adapter_name == 'gptqlora':  
         config = GPTQLoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
@@ -310,14 +308,21 @@ def train(
             bias="none",
             task_type="CAUSAL_LM",
             bits=bits,
-            groupsize=groupsize
+            groupsize=128
         )
-        config.save_pretrained(output_dir)
+        with init_empty_weights():
+            model = LlamaForCausalLM.from_pretrained(base_model,torch_dtype=torch.float16)
+        model = get_peft_model(model, config)
+        load_checkpoint_in_model(model,quant_checkpoint,device_map=device_map) #加载权重
+        torch.cuda.empty_cache()
+        gc.collect()
     
-    for name, param in model.named_parameters():
-        if 'lora' not in name:
-            param.requires_grad = False
-    torch.cuda.empty_cache()
+    if adapter_name == "prefix-tuning":
+        model.to('cuda')
+    # for name, param in model.named_parameters():
+    #     if 'lora' not in name:
+    #         param.requires_grad = False
+    
     if data_path.endswith(".json"):  # todo: support jsonl
         data = load_dataset("json", data_files=data_path)
     else:
