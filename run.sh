@@ -24,7 +24,7 @@ function finetune_multi(){
 # finetune_multi alpaca_gptqlora_13B_2bit $base_dir/alpaca_data_cleaned.json --adapter_name=gptqlora\ --target_modules="['q_proj','k_proj','v_proj','o_proj','up_proj','gate_proj','down_proj']"\ --base_model=/mnt/data/pyliu/llama-13b-hf\ --quant_checkpoint="/mnt/data/pyliu/gptq_checkpoints/llama-13b-2bit-formulate"\ --use_gradient_checkpointing\ --bits=2
 
 # 30B
-# finetune_multi alpaca_gptqlora_30B_2bit $base_dir/alpaca_data_cleaned.json --adapter_name=gptqlora\ --target_modules="['q_proj','k_proj','v_proj','o_proj','up_proj','gate_proj','down_proj']"\ --base_model=/mnt/data/pyliu/llama-30b-hf\ --quant_checkpoint="/mnt/data/pyliu/gptq_checkpoints/llama-30b-2bit-formulate"\ --use_gradient_checkpointing\ --bits=2
+# finetune_multi alpaca_gptqlora_30B_2bit $base_dir/alpaca_data_cleaned.json --adapter_name=gptqlora\ --target_modules="['q_proj','k_proj','v_proj','o_proj','up_proj','gGate_proj','down_proj']"\ --base_model=/mnt/data/pyliu/llama-30b-hf\ --quant_checkpoint="/mnt/data/pyliu/gptq_checkpoints/llama-30b-2bit-formulate"\ --use_gradient_checkpointing\ --bits=2
 
 # 65B
 # finetune_multi alpaca_gptqlora_65B_2bit $base_dir/alpaca_data_cleaned.json --adapter_name=gptqlora\ --target_modules="['q_proj','k_proj','v_proj','o_proj','up_proj','gate_proj','down_proj']"\ --base_model=/mnt/data/pyliu/llama-65b-hf\ --quant_checkpoint="/mnt/data/pyliu/gptq_checkpoints/llama65b-2bit-formulate"\ --use_gradient_checkpointing\ --bits=2
