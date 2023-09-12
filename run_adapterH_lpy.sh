@@ -1,11 +1,11 @@
-CUDA_VISIBLE_DEVICES=2 python finetune_ds_adapter.py \
+CUDA_VISIBLE_DEVICES=7 /home/textbox/miniconda3/bin/python finetune_ds_adapter.py \
   --base_model '/mnt/liupeiyu/llama_checkpoint/llama-7b-hf' \
   --data_path '/home/liupeiyu/QuantizedEmpirical/data/self_instruct.json' \
-  --output_dir '/mnt/textbox/tianyu.su/sty_test1' \
+  --output_dir '/mnt/liupeiyu/llama_checkpoint/sty_test1' \
   --batch_size 16 \
   --micro_batch_size 2 \
   --num_epochs 3 \
   --learning_rate 3e-4 \
   --cutoff_len 256 \
   --val_set_size 120 \
-  --adapter_name bottleneck > logs/sty1.log 2>&1 &
+  --adapter_name bottleneck > logs_lpy/test.log 2>&1 &
