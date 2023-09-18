@@ -33,3 +33,28 @@ function finetune_multi(){
 finetune_multi alpaca_gptqlora_70B_4bit $base_dir/alpaca_data_cleaned.json --adapter_name=gptqlora\ --target_modules="['q_proj','k_proj','v_proj','o_proj','up_proj','gate_proj','down_proj']"\ --base_model=/mnt/data/pyliu/llama2/llama2_70B_hf\ --quant_checkpoint="/mnt/data/pyliu/gptq_checkpoints/llama2-70b-4bit-formulate"\ --use_gradient_checkpointing\ --bits=4
 
 finetune_multi alpaca_gptqlora_70B_2bit $base_dir/alpaca_data_cleaned.json --adapter_name=gptqlora\ --target_modules="['q_proj','k_proj','v_proj','o_proj','up_proj','gate_proj','down_proj']"\ --base_model=/mnt/data/pyliu/llama2/llama2_70B_hf\ --quant_checkpoint="/mnt/data/pyliu/gptq_checkpoints/llama2-70b-2bit-formulate"\ --use_gradient_checkpointing\ --bits=2
+
+CUDA_VISIBLE_DEVICES=0 python finetune.py \
+  --base_model '/mnt/liupeiyu/llama_checkpoint/llama-7b-hf' \
+  --data_path './alpaca_data_cleaned.json' \
+  --output_dir '/mnt/textbox/tianyu.su/sty_test' \
+  --batch_size 16 \
+  --micro_batch_size 2 \
+  --num_epochs 3 \
+  --learning_rate 3e-4 \
+  --cutoff_len 256 \
+  --val_set_size 120 \
+  --adapter_name bottleneck > logs/sty.log 2>&1 &
+
+  
+CUDA_VISIBLE_DEVICES=0 python finetune_ds_adapter.py \
+  --base_model '/mnt/liupeiyu/llama_checkpoint/llama-7b-hf' \
+  --data_path '/home/liupeiyu/QuantizedEmpirical/data/self_instruct.json' \
+  --output_dir '/mnt/textbox/tianyu.su/sty_test1' \
+  --batch_size 16 \
+  --micro_batch_size 2 \
+  --num_epochs 3 \
+  --learning_rate 3e-4 \
+  --cutoff_len 256 \
+  --val_set_size 120 \
+  --adapter_name bottleneck > logs/sty1.log 2>&1 &
