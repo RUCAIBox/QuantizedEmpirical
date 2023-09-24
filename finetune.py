@@ -23,6 +23,7 @@ from peft import (  # noqa: E402
     prepare_model_for_int8_training,
     set_peft_model_state_dict,
     GPTQLoraConfig,
+    GPTQBottleneckConfig
 )
 import copy
 import numpy as np
@@ -316,7 +317,22 @@ def train(
         load_checkpoint_in_model(model,quant_checkpoint,device_map=device_map) #加载权重
         torch.cuda.empty_cache()
         gc.collect()
-    
+    elif adapter_name == "gptqbottleneck":
+        config = GPTQBottleneckConfig(
+            bottleneck_size=bottleneck_size,
+            non_linearity=non_linearity,
+            adapter_dropout=adapter_dropout,
+            use_parallel_adapter=use_parallel_adapter,
+            use_adapterp=use_adapterp,
+            target_modules=target_modules,
+            scaling=scaling,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, config)
+        torch.cuda.empty_cache()
+        gc.collect()
+
     if adapter_name == "prefix-tuning":
         model.to('cuda')
     # for name, param in model.named_parameters():
