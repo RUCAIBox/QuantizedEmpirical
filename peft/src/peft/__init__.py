@@ -30,6 +30,8 @@ from .peft_model import (
 from .tuners import (
     GPTQLoraConfig,
     GPTQLoraModel,
+    GPTQBottleneckConfig,
+    GPTQBottleneckModel,
     LoraConfig,
     LoraModel,
     BottleneckConfig,

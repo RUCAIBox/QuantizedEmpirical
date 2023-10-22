@@ -33,6 +33,8 @@ class PeftType(str, enum.Enum):
     MPO = "MPO"
     FFT = "FFT"
     GPTQLORA = "GPTQLORA"
+    GPTQBOTTLENECK = "GPTQBOTTLENECK"
+    GPTQPREFIX = "GPTQPREFIX"
 
 
 

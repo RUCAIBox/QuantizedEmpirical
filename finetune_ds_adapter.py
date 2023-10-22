@@ -1,13 +1,13 @@
-import os
+import os, sys, utils, gc
 import sys
 from typing import List
+from dataclasses import dataclass, field
 
 import fire
 import torch
 import transformers
 from datasets import load_dataset
-from typing import List, Optional, Union
-import gc
+from typing import List, Optional, Union, Dict, Sequence
 
 """
 Unused imports:
@@ -23,17 +23,20 @@ from peft import (  # noqa: E402
     prepare_model_for_int8_training,
     set_peft_model_state_dict,
     GPTQLoraConfig,
-    GPTQBottleneckConfig
 )
 import copy
 import numpy as np
 import random
+
+
+import logging
 from accelerate.utils import infer_auto_device_map
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, LlamaConfig, AutoModel  # noqa: F402
 from transformers import LlamaForCausalLM, Trainer
 from transformers.modeling_utils import _load_state_dict_into_meta_model
 from models.quant.quant_linear_lora import make_quant_linear
 from models.bigmodeling import init_empty_weights, load_checkpoint_and_dispatch, load_checkpoint_in_model, dispatch_model
+from torch.utils.data import Dataset
 
 seed_value = 2023   # 设定随机数种子
 os.environ['PYTHONHASHSEED'] = str(seed_value)  # 为了禁止hash随机化，使得实验可复现。
@@ -53,10 +56,29 @@ module_dic = {
     'down_proj': "layers.{}.mlp.down_proj",
     'up_proj': "layers.{}.mlp.up_proj",
 }
-# DEFAULT_PAD_TOKEN = "[PAD]"
-# DEFAULT_EOS_TOKEN = "</s>"
-# DEFAULT_BOS_TOKEN = "<s>"
-# DEFAULT_UNK_TOKEN = "<unk>"
+
+IGNORE_INDEX = -100
+DEFAULT_PAD_TOKEN = "[PAD]"
+DEFAULT_EOS_TOKEN = "</s>"
+DEFAULT_BOS_TOKEN = "<s>"
+DEFAULT_UNK_TOKEN = "<unk>"
+PROMPT_DICT = {
+    "prompt_input": (
+        "Below is an instruction that describes a task, paired with an input that provides further context. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
+    ),
+    "prompt_no_input": (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Response:"
+    ),
+    "prompt_dialogue":(
+        "The following is a conversation between a human and an AI assistant. "
+        "The AI assistant gives helpful, detailed, and polite answers to the user's questions.\n"
+        "{input}\n\n[|AI|]:"
+    )
+}
 def train(
         # model/data params
         base_model: str = "",  # the only required argument
@@ -103,7 +125,12 @@ def train(
         # quant_params
         bits : int = 16,
         groupsize : int = 128,
-        quant_checkpoint : str = ""
+        quant_checkpoint : str = "",
+        # survey param
+        model_max_length : int = 2048,
+        fsdp : str = "",
+        fsdp_transformer_layer_cls_to_wrap : str = "",
+        load_in_8bit: bool = False
 ):
     print(
         f"Finetuning model with params:\n"
@@ -141,13 +168,16 @@ def train(
         f"groupsize: {groupsize}\n"
         f"transformers version: {transformers.__version__}\n"
         f"quant_checkpoint: {quant_checkpoint}\n"
+        f"model_max_length: {model_max_length}\n"
+        f"fsdp: {fsdp}\n"
+        f"fsdp_transformer_layer_cls_to_wrap: {fsdp_transformer_layer_cls_to_wrap}\n"
     )
     assert (
         base_model
     ), "Please specify a --base_model, e.g. --base_model='decapoda-research/llama-7b-hf'"
     gradient_accumulation_steps = batch_size // micro_batch_size
 
-    device_map = "auto"
+    device_map = {"":0}
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
     if ddp:
@@ -195,7 +225,8 @@ def train(
 
     if model.config.model_type == "llama":
         # Due to the name of transformers' LlamaTokenizer, we have to do this
-        tokenizer = LlamaTokenizer.from_pretrained(base_model, add_eos_token=True)
+        tokenizer = LlamaTokenizer.from_pretrained(base_model, add_eos_token=True,
+                                                   model_max_length=model_max_length, padding_side="right", use_fast=False) # from zk
     else:
         tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True, add_eos_token=True)
     # tokenizer.add_special_tokens(
@@ -206,52 +237,45 @@ def train(
     #     }
     # )
 
-    tokenizer.pad_token_id = (
-        0  # unk. we want this to be different from the eos token
+    special_tokens_dict = dict()
+    if tokenizer.pad_token is None:
+        special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
+    if tokenizer.eos_token is None:
+        special_tokens_dict["eos_token"] = DEFAULT_EOS_TOKEN
+    if tokenizer.bos_token is None:
+        special_tokens_dict["bos_token"] = DEFAULT_BOS_TOKEN
+    if tokenizer.unk_token is None:
+        special_tokens_dict["unk_token"] = DEFAULT_UNK_TOKEN
+
+    # tokenizer.pad_token_id = (
+    #     0  # unk. we want this to be different from the eos token
+    # )
+    # tokenizer.padding_side = "left"  # Allow batched inference
+    def smart_tokenizer_and_embedding_resize(
+        special_tokens_dict: Dict,
+        tokenizer: transformers.PreTrainedTokenizer,
+        model: transformers.PreTrainedModel,
+    ):
+        """Resize tokenizer and embedding.
+        Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
+        """
+        num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
+        model.resize_token_embeddings(len(tokenizer))
+        if num_new_tokens > 0:
+            input_embeddings = model.get_input_embeddings().weight.data
+            output_embeddings = model.get_output_embeddings().weight.data
+
+            input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+            output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+
+            input_embeddings[-num_new_tokens:] = input_embeddings_avg
+            output_embeddings[-num_new_tokens:] = output_embeddings_avg
+    smart_tokenizer_and_embedding_resize(
+        special_tokens_dict=special_tokens_dict,
+        tokenizer=tokenizer,
+        model=model,
     )
-    tokenizer.padding_side = "left"  # Allow batched inference
 
-    def tokenize(prompt, add_eos_token=True):
-        # there's probably a way to do this with the tokenizer settings
-        # but again, gotta move fast
-        result = tokenizer(
-            prompt,
-            truncation=True,
-            max_length=cutoff_len,
-            padding=False,
-            return_tensors=None,
-        )
-        if (
-                result["input_ids"][-1] != tokenizer.eos_token_id
-                and len(result["input_ids"]) < cutoff_len
-                and add_eos_token
-        ):
-            result["input_ids"].append(tokenizer.eos_token_id)
-            if "chatglm" not in base_model:
-                result["attention_mask"].append(1)
-
-        result["labels"] = result["input_ids"].copy()
-
-        if "chatglm" in base_model:
-            return {"input_ids": result["input_ids"], "labels": result["labels"]}
-        else:
-            return result
-
-    def generate_and_tokenize_prompt(data_point):
-        full_prompt = generate_prompt(data_point)
-        tokenized_full_prompt = tokenize(full_prompt)
-        if not train_on_inputs:
-            user_prompt = generate_prompt({**data_point, "output": ""})
-            tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
-            user_prompt_len = len(tokenized_user_prompt["input_ids"])
-
-            tokenized_full_prompt["labels"] = [
-                                                  -100
-                                              ] * user_prompt_len + tokenized_full_prompt["labels"][
-                                                                    user_prompt_len:
-                                                                    ]  # could be sped up, probably
-        return tokenized_full_prompt
-    
     model = prepare_model_for_int8_training(model, use_gradient_checkpointing=use_gradient_checkpointing)
     
     if "chatglm" in base_model:
@@ -317,24 +341,13 @@ def train(
         load_checkpoint_in_model(model,quant_checkpoint,device_map=device_map) #加载权重
         torch.cuda.empty_cache()
         gc.collect()
-    elif adapter_name == "gptqbottleneck":
-        config = GPTQBottleneckConfig(
-            bottleneck_size=bottleneck_size,
-            non_linearity=non_linearity,
-            adapter_dropout=adapter_dropout,
-            use_parallel_adapter=use_parallel_adapter,
-            use_adapterp=use_adapterp,
-            target_modules=target_modules,
-            scaling=scaling,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, config)
-        torch.cuda.empty_cache()
-        gc.collect()
-
+    
     if adapter_name == "prefix-tuning":
         model.to('cuda')
+    if adapter_name == "lora":
+        for name, param in model.named_parameters():
+            if 'lora' not in name:
+                param.requires_grad = False
     # for name, param in model.named_parameters():
     #     if 'lora' not in name:
     #         param.requires_grad = False
@@ -367,19 +380,112 @@ def train(
     model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
     print(f"After Loaded  with {torch.cuda.max_memory_allocated() / 1024 ** 3:.2f} GiB")
 
-    if val_set_size > 0:
-        train_val = data["train"].train_test_split(
-            test_size=val_set_size, shuffle=True, seed=42
-        )
-        train_data = (
-            train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-        )
-        val_data = (
-            train_val["test"].shuffle().map(generate_and_tokenize_prompt)
-        )
-    else:
-        train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
-        val_data = None
+    # if val_set_size > 0:
+    #     train_val = data["train"].train_test_split(
+    #         test_size=val_set_size, shuffle=True, seed=42
+    #     )
+    #     train_data = (
+    #         train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+    #     )
+    #     val_data = (
+    #         train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+    #     )
+    # else:
+    #     train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
+    #     val_data = None
+
+    def preprocess(
+        sources: Sequence[str],
+        targets: Sequence[str],
+        tokenizer: transformers.PreTrainedTokenizer,
+    ) -> Dict:
+        """Preprocess the data by tokenizing."""
+        examples = [s + t for s, t in zip(sources, targets)]
+        # examples_tokenized, sources_tokenized = [_tokenize_fn(strings, tokenizer) for strings in (examples, sources)]
+        input_id_list, label_list = [], []
+        for example in examples:
+            raw_text = example.rstrip(tokenizer.eos_token)
+            text = []
+            # input_ids_list, labels_list = [], []
+            for i, txt in enumerate(raw_text.split('\n\n[|AI|]:')):
+                if i == 0:
+                    text.append(txt + '\n\n[|AI|]:')
+                else:
+                    split_txt = txt.split('\n\n[|Human|]:')
+                    ai_txt = split_txt[0]
+                    text.append(ai_txt + tokenizer.eos_token)
+                    if len(split_txt) == 2:
+                        human_txt = split_txt[1]
+                        text.append('\n\n[|Human|]:' + human_txt + '\n\n[|AI|]:')
+            inputs = tokenizer(text=text, max_length=tokenizer.model_max_length, truncation=True)
+            input_ids, labels = [], []
+            for i, iids in enumerate(inputs['input_ids']):
+                if i != 0:
+                    iids = iids[1:]
+                # LPY! add max length constraint
+                if len(input_ids) + len(iids) > tokenizer.model_max_length:
+                    break
+                # LPY! add max length constraint
+                input_ids.extend(iids)
+                if i % 2 == 0:
+                    labels.extend([IGNORE_INDEX] * len(iids))
+                else:
+                    labels.extend(iids)
+            input_ids = torch.tensor(input_ids, dtype=torch.long)
+            labels = torch.tensor(labels, dtype=torch.long)
+            input_id_list.append(input_ids)
+            label_list.append(labels)
+        return dict(input_ids=input_id_list, labels=label_list)
+                
+    class SupervisedDataset(Dataset):
+        """Dataset for supervised fine-tuning."""
+
+        def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
+            super(SupervisedDataset, self).__init__()
+            print("Loading data...")
+            list_data_dict = utils.jload(data_path)
+
+            print("Formatting inputs...")
+            # prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
+            prompt = PROMPT_DICT['prompt_dialogue']
+            sources = [
+                prompt.format_map(example)
+                for example in list_data_dict
+            ]
+            targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
+
+            print("Tokenizing inputs... This may take some time...")
+            data_dict = preprocess(sources, targets, tokenizer)
+
+            self.input_ids = data_dict["input_ids"]
+            self.labels = data_dict["labels"]
+
+        def __len__(self):
+            return len(self.input_ids)
+
+        def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+            return dict(input_ids=self.input_ids[i], labels=self.labels[i])
+
+    @dataclass
+    class DataCollatorForSupervisedDataset(object):
+        """Collate examples for supervised fine-tuning."""
+
+        tokenizer: transformers.PreTrainedTokenizer
+
+        def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+            input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+            input_ids = torch.nn.utils.rnn.pad_sequence(
+                input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+            )
+            labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+            return dict(
+                input_ids=input_ids,
+                labels=labels,
+                attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+            )
+    train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_path)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    
 
     if not ddp and torch.cuda.device_count() > 1:
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
@@ -387,13 +493,14 @@ def train(
         model.model_parallel = True
     
     total_batch_size = micro_batch_size* gradient_accumulation_steps * (world_size if ddp else 1) 
-    total_optim_steps = train_data.num_rows * num_epochs // total_batch_size
+    total_optim_steps = len(train_dataset) * num_epochs // total_batch_size
     saving_step = int(total_optim_steps/10)
+    print(f"word_size: {world_size}, total_optim_steps: {total_optim_steps}")
 
     trainer = Trainer(
         model=model,
-        train_dataset=train_data,
-        eval_dataset=val_data,
+        train_dataset=train_dataset,
+        eval_dataset=None,
         args=transformers.TrainingArguments(
             per_device_train_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -403,22 +510,21 @@ def train(
             fp16=True,
             logging_steps=10,
             optim="adamw_torch",
-            evaluation_strategy="steps" if val_set_size > 0 else "no",
+            evaluation_strategy="no",
             save_strategy="steps",
-            eval_steps=saving_step if val_set_size > 0 else None,
+            eval_steps=None,
             save_steps=saving_step,
             output_dir=output_dir,
             save_total_limit=1,
-            load_best_model_at_end=True if val_set_size > 0 else False,
+            load_best_model_at_end=False,
             ddp_find_unused_parameters=False if ddp else None,
             group_by_length=group_by_length,
             report_to="wandb" if use_wandb else None,
             run_name=wandb_run_name if use_wandb else None,
-            label_names=['labels']
+            label_names=['labels'],
+            # deepspeed="/home/pyliu/projects/git_pro/QuantizedEmpirical/zero_stage2_offload_config.json"
         ),
-        data_collator=transformers.DataCollatorForSeq2Seq(
-            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-        ),
+        data_collator=data_collator
     )
     model.config.use_cache = False
 
@@ -442,29 +548,6 @@ def train(
     print(
         "\n If there's a warning about missing keys above, please disregard :)"
     )
-
-
-def generate_prompt(data_point):
-    # sorry about the formatting disaster gotta move fast
-    if data_point["input"]:
-        return f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request. 
-
-                ### Instruction:
-                {data_point["instruction"]}
-                
-                ### Input:
-                {data_point["input"]}
-                
-                ### Response:
-                {data_point["output"]}""" # noqa: E501
-    else:
-        return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.  
-
-                ### Instruction:
-                {data_point["instruction"]}
-                
-                ### Response:
-                {data_point["output"]}""" # noqa: E501
 
 
 if __name__ == "__main__":

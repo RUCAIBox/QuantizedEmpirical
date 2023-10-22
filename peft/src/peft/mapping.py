@@ -20,7 +20,7 @@ from .peft_model import (
     PeftModelForSequenceClassification,
     PeftModelForTokenClassification,
 )
-from .tuners import LoraConfig, PrefixTuningConfig, PromptEncoderConfig, PromptTuningConfig, BottleneckConfig, GPTQLoraConfig
+from .tuners import LoraConfig, PrefixTuningConfig, PromptEncoderConfig, PromptTuningConfig, BottleneckConfig, GPTQLoraConfig, GPTQBottleneckConfig
 from .utils import PromptLearningConfig
 
 
@@ -37,7 +37,8 @@ PEFT_TYPE_TO_CONFIG_MAPPING = {
     "P_TUNING": PromptEncoderConfig,
     "LORA": LoraConfig,
     "BOTTLENECK": BottleneckConfig,
-    "GPTQLORA": GPTQLoraConfig
+    "GPTQLORA": GPTQLoraConfig,
+    "GPTQBOTTLENECK": GPTQBottleneckConfig
 }
 
 TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING = {
@@ -208,6 +209,9 @@ def get_peft_model(model, peft_config):
             return PeftModel(model, peft_config)
         elif peft_config.peft_type == "GPTQLORA":
             peft_config = _prepare_lora_config(peft_config, model_config)
+            return PeftModel(model, peft_config)
+        elif peft_config.peft_type == "GPTQBOTTLENECK":
+            peft_config = _prepare_bottleneck_config(peft_config, model_config)
             return PeftModel(model, peft_config)
     if not isinstance(peft_config, PromptLearningConfig):
         if peft_config.peft_type == "BOTTLENECK":
